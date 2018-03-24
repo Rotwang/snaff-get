@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import boto3
+import botocore
+import configparser
+from functools import lru_cache
+import getpass
+import gzip
+import hashlib
+import os
+import socket
+import stat
+import sys
+import tempfile
+import traceback
+import urllib3
+
+
+def report(msg):
+    print("[ REQUESTING ] {}".format(msg))
+
+def warn(msg):
+    print("[ WARNING ] {}".format(msg), file=sys.stderr)
+
+class Singleton(type):
+    instance = None
+
+    def __call__(cls, *args, **kwargs):
+        if not cls.instance:
+            cls.instance = super(Singleton, cls).__call__(*args, **kwargs)
+        return cls.instance
+
+
+class OsUtil(object):  # take umask into account
+    def __init__(self, path):
+        self.path = os.path.expanduser(path)
+
+    def mkdir_p(self, mode=0o700):
+        if not os.path.isdir(self.path):
+            os.makedirs(self.path)
+            os.chmod(self.path, mode)
+
+    def touch(self, mode=0o600):
+        if not os.path.isfile(self.path):
+            open(self.path, "a").close()
+            os.chmod(self.path, mode)
+
+
+class CliArgs(object, metaclass=Singleton):
+    def __init__(self):
+        parser = argparse.ArgumentParser(description='Generate access keys for available "assume roles".')
+        parser.add_argument('--config-dir', '-c',
+                            default=os.path.expanduser("~/.aws"),
+                            type=os.path.expanduser,
+                            help="Root of the aws cli config directory.",
+                            action='store')
+        parser.add_argument('--profile', '-p',
+                            default="default",
+                            help="Account profile to use for initial credentials.",
+                            action='store', type=str)
+        parser.add_argument('--accounts', '-a',
+                            help="Account ids to obtain credentials for.",
+                            default=[],
+                            nargs='+', type=str)
+        parser.add_argument('--roles', '-r',
+                            help="Role names to obtain credentials for.",
+                            default=[],
+                            nargs='+', type=str)
+        parser.add_argument('--mfa-dev', '-m',
+                            default="",
+                            help="MFA device arn.",
+                            action='store', type=str)
+        parser.add_argument('--duration', '-d',
+                            default="3600",
+                            help="Duration in seconds of the role session.",
+                            action='store', type=int)
+        parser.add_argument('--check-upgrade', '-e',
+                            default=False,
+                            help="Check if a new snaff-get version is available.",
+                            action='store_true')
+        parser.add_argument('--upgrade', '-u',
+                            default=False,
+                            help="Upgrade snaff-get (unconditionally).",
+                            action='store_true')
+        self.cliargs = parser.parse_args()
+
+    def __getattr__(self, name):
+        return getattr(self.cliargs, name)
+
+
+class BotoSession(object, metaclass=Singleton):
+    def __init__(self):
+        mfa_dev = BotoSession.select_mfa_device_arn()
+        report("{} profile session token.".format(CliArgs().profile))
+        key = boto3.session.Session(profile_name=CliArgs().profile).client('sts').get_session_token(
+            SerialNumber=mfa_dev,
+            TokenCode=input("Give mfa token for device {}: ".format(mfa_dev)),
+            DurationSeconds=CliArgs().duration
+        )
+        BotoSession.key = key
+        self.session = boto3.session.Session(profile_name=CliArgs().profile,
+                                             aws_access_key_id=key['Credentials']['AccessKeyId'],
+                                             aws_secret_access_key=key['Credentials']['SecretAccessKey'],
+                                             aws_session_token=key['Credentials']['SessionToken'])
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def get_mfa_devices_arn(cls):
+        return list(
+            map(
+                lambda x: x['SerialNumber'],
+                boto3.session.Session(profile_name=CliArgs().profile).client('iam').list_mfa_devices()['MFADevices']
+            )
+        )
+
+    @classmethod
+    def select_mfa_device_arn(cls):
+        report("MFA device's arn.")
+        if CliArgs().mfa_dev:
+            return CliArgs().mfa_dev
+        return cls.get_mfa_devices_arn()[0]
+
+    def __getattr__(self, name):
+        return getattr(self.session, name)
+
+
+class UserInfo(object, metaclass=Singleton):
+    def __init__(self):
+        self.user = BotoSession().resource('iam').CurrentUser()
+
+    def __getattr__(self, name):
+        return getattr(self.user, name)
+
+
+class AccountInfo(object, metaclass=Singleton):
+    @classmethod
+    def report(cls, msg):
+        print("[ REQUESTING ] {}".format(msg))
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def get_caller_identity(cls):
+        report("Caller identity.")
+        return BotoSession().client('sts').get_caller_identity()
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def get_role_keys(cls, role_arn):
+        report("Credentials for role: {}".format(role_arn))
+        return BotoSession().client('sts').assume_role(
+            RoleArn=role_arn,
+            RoleSessionName='{}-{}'.format(getpass.getuser(), socket.gethostname()),
+            DurationSeconds=CliArgs().duration
+        )
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def get_session_token(cls):
+        return BotoSession.key
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def get_available_policy_arns(cls):
+        report("IAM policy arns for user {}".format(UserInfo().user_name))
+
+        def paginate(what, who, args):
+            p = BotoSession().client('iam').get_paginator(what)
+            for page in p.paginate(**args):
+                policies.update(
+                    map(lambda e: e['PolicyArn'],
+                        page[who])
+                )
+        policies = set()
+        paginate('list_user_policies',
+                 'PolicyNames',
+                 {'UserName': UserInfo().user_name})
+        paginate('list_attached_user_policies',
+                 'AttachedPolicies',
+                 {'UserName': UserInfo().user_name})
+
+        for group in BotoSession().client('iam').list_groups_for_user(UserName=UserInfo().user_name)['Groups']:
+            paginate('list_group_policies',
+                     'PolicyNames',
+                     {'GroupName': group['GroupName']})
+            paginate('list_attached_group_policies',
+                     'AttachedPolicies',
+                     {'GroupName': group['GroupName']})
+        return policies
+
+    def get_assume_role_arns(self):
+        def is_sts_assume(doc):
+            if doc['Effect'] == 'Allow' and doc['Action'] == 'sts:AssumeRole':
+                return True
+
+        unique_roles = set()
+        for p in self.get_available_policy_documents():
+            statement = p['Statement']
+            if isinstance(statement, dict):
+                statement = [statement]
+            for s in statement:
+                if is_sts_assume(s):
+                    unique_roles.add(s['Resource'])
+        return unique_roles
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def get_available_policy_documents(cls):
+        def get_policy_version(policy_arn):
+            p = BotoSession().client('iam').get_paginator('list_policy_versions')
+            return [next(filter(lambda e: e['IsDefaultVersion'], page['Versions']))['VersionId']
+                    for page in p.paginate(PolicyArn=policy_arn)][0]
+
+        for policy_arn in cls.get_available_policy_arns():
+            report("IAM policy {}".format(policy_arn))
+            version = get_policy_version(policy_arn)
+            yield BotoSession().client('iam').get_policy_version(PolicyArn=policy_arn,
+                                                                 VersionId=version)['PolicyVersion']['Document']
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def get_human_readable_account_names(cls, acc_key_id, sec_acc_key, ses_tkn):
+        report("Account aliases for key {}".format(acc_key_id))
+        c = BotoSession().client(
+            'iam',
+            aws_access_key_id=acc_key_id,
+            aws_secret_access_key=sec_acc_key,
+            aws_session_token=ses_tkn
+        )
+        p = c.get_paginator('list_account_aliases')
+        names = []
+        for page in p.paginate():
+            names.extend(page['AccountAliases'])
+        return names
+
+    def get_auth_keys(self, role_arn=None):
+        if role_arn:
+            session = self.get_role_keys(role_arn)
+        else:
+            session = self.get_session_token()
+        aliases = self.get_human_readable_account_names(session['Credentials']['AccessKeyId'],
+                                                        session['Credentials']['SecretAccessKey'],
+                                                        session['Credentials']['SessionToken'])
+        return {'keys': {'AccessKeyId': session['Credentials']['AccessKeyId'],
+                         'SecretAccessKey': session['Credentials']['SecretAccessKey'],
+                         'SessionToken': session['Credentials']['SessionToken']},
+                'aliases': aliases}
+
+
+class AssumeKeys(object):
+    def __iter__(self):
+        for x in AccountInfo().get_assume_role_arns():
+            yield x
+
+    def __getitem__(self, role_arn):
+        try:
+            return AccountInfo().get_auth_keys(role_arn)
+        except botocore.exceptions.ClientError as e:
+            warn("Can't request keys for role: '{}'".format(role_arn))
+            warn("Gzipped traceback (extract with: base64 -D <<<{base64} | gzip -d)")
+            warn(base64.b64encode(gzip.compress(traceback.format_exc().encode("utf-8"))).decode("utf-8"))
+            return {'keys': {}, 'aliases': []}
+
+    def __repr__(self):
+        return str(list(self))
+
+
+class MasterKeys(object):
+    def __iter__(self):
+        yield AccountInfo().get_caller_identity()['Arn']
+
+    def __getitem__(self, role_arn):
+        return AccountInfo().get_auth_keys()
+
+
+class AwsConfig(object):
+    def __init__(self, keys):
+        self.keys = keys
+        self.conf_root = CliArgs().config_dir
+
+    def get_role_name_from_arn(self, arn):
+        spl = arn.split('/')
+        role = spl[-1]
+        t = spl[-2].split(':')[-1]
+        if t != "role":  # it is not a role
+            return ""
+        return role
+
+    def get_account_id_from_arn(self, arn):
+        return arn.split(':')[4]
+
+    def get_profile_names(self, arn):
+        r = self.get_role_name_from_arn(arn)
+        if self.keys[arn]['aliases']:
+            names = self.keys[arn]['aliases']
+        else:
+            names = [self.get_account_id_from_arn(arn)]
+        if not r:
+            return map(lambda n: "{}".format(n), names)
+        return map(lambda n: "{}-{}".format(n, r), names)
+
+    def load_ini(self, path):
+        OsUtil(os.path.dirname(path)).mkdir_p()
+        OsUtil(path).touch()
+        config = configparser.ConfigParser()
+        config.read(path)
+        return config
+
+    def find_roles(self, accounts, roles):
+        for arn in self.keys:
+            a = self.get_account_id_from_arn(arn)
+            r = self.get_role_name_from_arn(arn)
+            accounts_filtered = filter(lambda x: x == a, accounts)
+            roles_filtered = filter(lambda x: x == r, roles)
+
+            if accounts and roles:
+                if list(accounts_filtered) and list(roles_filtered):
+                    yield arn
+            elif accounts:
+                if list(accounts_filtered):
+                    yield arn
+            elif roles:
+                if list(roles_filtered):
+                    yield arn
+            else:
+                yield arn
+
+    def get_profiles(self, accounts, roles):
+        for arn in self.find_roles(accounts, roles):
+            for profile in self.get_profile_names(arn):
+                yield {'arn': arn, 'name': profile}
+
+    def update_config(self, profiles, ini_file, update_func):
+        config = self.load_ini(ini_file)
+        for p in profiles:
+            ret = update_func(p)
+            config[ret['key']] = ret['val']
+        with open(ini_file, 'w') as fh:
+            config.write(fh)
+
+    def update(self, accounts=None, roles=None):
+        accounts = [] if not accounts else accounts
+        roles = [] if not roles else roles
+
+        def update_cfg(profile):
+            return {'key': 'profile {}'.format(profile['name']),
+                    'val': {'region': BotoSession().region_name}}
+
+        def update_creds(profile):
+            tr = {'AccessKeyId': 'aws_access_key_id',
+                  'SecretAccessKey': 'aws_secret_access_key',
+                  'SessionToken': 'aws_session_token'}
+            keys = self.keys[profile['arn']]['keys']
+
+            return {'key': profile['name'],
+                    'val': dict(map(lambda x: (tr[x], keys[x]), keys))}
+
+        profiles = list(self.get_profiles(accounts, roles))
+
+        self.update_config(profiles,
+                           os.path.join(self.conf_root, "config"),
+                           update_cfg)
+        self.update_config(profiles,
+                           os.path.join(self.conf_root, "credentials"),
+                           update_creds)
+
+class SelfUpgrade(object, metaclass=Singleton):
+    UPSTREAM = "https://raw.githubusercontent.com/Rotwang/snaff-get/master/snaff-get"
+    BUF_SIZE = 1048576
+
+    def __init__(self):
+        self.me = os.path.realpath(__file__)
+
+    @classmethod
+    @lru_cache(maxsize=None)
+    def get_upstream_fh(cls):
+        temp = tempfile.TemporaryFile()
+        response = urllib3.PoolManager().request('GET', cls.UPSTREAM, preload_content=False)
+
+        chunk = response.read(cls.BUF_SIZE)
+        while chunk != b"":
+            temp.write(chunk)
+            chunk = response.read(cls.BUF_SIZE)
+        temp.seek(0)
+        return temp
+
+    def get_upstream(self):
+        new_fh = os.dup(self.get_upstream_fh().fileno())
+        f = os.fdopen(new_fh, 'rb')
+        f.seek(0)
+        return f
+
+    def get_hash_alg(self):
+        pref_algs = ['SHA512', 'SHA384', 'SHA256', 'SHA224']
+        for a in pref_algs:
+            try:
+                return hashlib.new(a)
+            except ValueError:
+                try:
+                    return hashlib.new(a.lower())
+                except ValueError:
+                    pass
+        avail = list(hashlib.algorithms_available)
+        avail.sort()
+        return hashlib.new(avail[0])
+
+    def mysum(self):
+        m = self.get_hash_alg()
+        with open(self.me, 'rb') as fh:
+            chunk = fh.read(self.BUF_SIZE)
+            while chunk != b"":
+                m.update(chunk)
+                chunk = fh.read(self.BUF_SIZE)
+        return m
+
+    def newsum(self):
+        r = self.get_upstream()
+        m = self.get_hash_alg()
+        chunk = r.read(self.BUF_SIZE)
+        while chunk != b"":
+            m.update(chunk)
+            chunk = r.read(self.BUF_SIZE)
+        return m
+
+    def upstream_digest_mismatch(self):
+        if self.mysum().digest() != self.newsum().digest():
+            return True
+        return False
+
+    def do_upgrade(self):
+        orig_st = os.stat(self.me)
+        new = tempfile.NamedTemporaryFile(dir=os.path.dirname(self.me), delete=False)
+        os.chmod(new.name, stat.S_IREAD | stat.S_IWRITE)
+        upstream = self.get_upstream()
+
+        chunk = upstream.read(self.BUF_SIZE)
+        while chunk != b"":
+            new.write(chunk)
+            chunk = upstream.read(self.BUF_SIZE)
+
+        new.close()
+        os.rename(new.name, self.me)
+
+        os.chmod(self.me, orig_st.st_mode & 0o7777)
+        os.chown(self.me, orig_st.st_uid, orig_st.st_gid)
+
+def check_upgrade():
+    if SelfUpgrade().upstream_digest_mismatch():
+        print("New version is available!")
+        sys.exit(0)
+    print("I'm up to date!")
+    sys.exit(1)
+
+def upgrade():
+    SelfUpgrade().do_upgrade()
+    print("I'm upgraded (or at least refreshed).")
+
+if __name__ == "__main__":
+    if CliArgs().check_upgrade:
+        check_upgrade()
+    elif CliArgs().upgrade:
+        upgrade()
+    else:
+        AwsConfig(AssumeKeys()).update(CliArgs().accounts, CliArgs().roles)
+        AwsConfig(MasterKeys()).update()
